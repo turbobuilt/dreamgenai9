@@ -98,8 +98,8 @@ def main():
 
     # Set up optimizer and loss functions
     optimizer = torch.optim.Adam(params=model.parameters(), lr=args.lr)
-    text_criterion = nn.CrossEntropyLoss()
-    image_criterion = nn.MSELoss()
+    # We'll use MSE loss for both text and image reconstruction
+    reconstruction_criterion = nn.MSELoss()
     
     # Initialize training state
     step = 0
@@ -157,31 +157,47 @@ def main():
             # Training step
             optimizer.zero_grad()
             
-            # Phase 1: Text Generation - Using teacher forcing
+            # Phase 1: Text Generation - Using teacher forcing and end-to-end reconstruction
             text_loss = 0
             if args.device == 'cuda':
                 with autocast('cuda'):  # Updated to new format
-                    # Tokenize input text
+                    # Convert input text to bytes tensor for reconstruction comparison
                     input_text = captions
+                    input_bytes = text_tokenizer.text_to_bytes_tensor(input_text).to(device)
+                    
                     # Target is the same text shifted by one position
-                    text_target_embeddings, text_target_tokens = text_tokenizer(captions)
-                    text_target_embeddings = text_target_embeddings[:, 1:, :].to(device)  # Shift by one
-                    text_target_tokens = text_target_tokens[:, 1:].to(device)  # Shift by one
+                    # We'll use the byte representation for direct comparison
+                    if len(input_bytes.shape) == 3:  # [batch, seq_len, 1]
+                        # Create shifted target (remove first byte, add zero at end)
+                        target_bytes = torch.cat([
+                            input_bytes[:, 1:, :], 
+                            torch.zeros((input_bytes.shape[0], 1, 1), device=device)
+                        ], dim=1)
                     
                     # Feed to model with teacher forcing
-                    text_outputs = model(input_text, mode="text_to_text", generate=False, 
-                                         target_outputs=text_target_embeddings)
+                    # Use original text embeddings as input context
+                    text_outputs = model(input_text, mode="text_to_text", generate=False,
+                                         target_outputs=caption_embeddings)
                     
-                    # Apply inverse text tokenizer to get logits
-                    text_logits = inverse_text_tokenizer(text_outputs)
+                    # Apply inverse text tokenizer to get reconstructed byte sequences
+                    # This now returns the actual reconstructed bytes, not just logits
+                    reconstructed_bytes = inverse_text_tokenizer(text_outputs, return_bytes=True)
                     
-                    # Calculate text loss
-                    text_loss = text_criterion(text_logits.view(-1, text_logits.size(-1)), 
-                                              text_target_tokens.view(-1))
+                    print("input text", input_text)
+                    print(f"Reconstructed bytes shape: {reconstructed_bytes.shape}")
+                    print(f"Target bytes shape: {target_bytes.shape}")
+                    
+                    # Make sure shapes match for comparison
+                    min_len = min(reconstructed_bytes.shape[1], target_bytes.shape[1])
+                    reconstructed_bytes = reconstructed_bytes[:, :min_len, :]
+                    target_bytes = target_bytes[:, :min_len, :]
+                    
+                    # Calculate text reconstruction loss using MSE
+                    text_loss = reconstruction_criterion(reconstructed_bytes, target_bytes)
                     
                     # Phase 2: Image Generation - Using teacher forcing
-                    # Tokenize the target image
-                    target_image_embeddings, target_image_tokens = model.image_tokenizer(images)
+                    # This part remains similar as it's already using reconstruction
+                    target_image_embeddings, _ = model.image_tokenizer(images)
                     target_image_embeddings = target_image_embeddings.to(device)
                     
                     # Feed to model with teacher forcing
@@ -193,27 +209,40 @@ def main():
                                                                    original_size=model.image_size)
                     
                     # Calculate image loss - ensure both tensors are on the same device
-                    image_loss = image_criterion(predicted_image, images.to(predicted_image.device))
+                    image_loss = reconstruction_criterion(predicted_image, images.to(predicted_image.device))
                     
                     # Combined loss
                     loss = text_loss + image_loss
             else:
                 # Non-CUDA implementation without autocast
-                # Text generation with teacher forcing
+                # Text generation with teacher forcing and reconstruction
                 input_text = captions
-                text_target_embeddings, text_target_tokens = text_tokenizer(captions)
-                text_target_embeddings = text_target_embeddings[:, 1:, :].to(device)
-                text_target_tokens = text_target_tokens[:, 1:].to(device)
+                input_bytes = text_tokenizer.text_to_bytes_tensor(input_text).to(device)
                 
-                text_outputs = model(input_text, mode="text_to_text", generate=False, 
-                                     target_outputs=text_target_embeddings)
+                # Create shifted target
+                if len(input_bytes.shape) == 3:  # [batch, seq_len, 1]
+                    target_bytes = torch.cat([
+                        input_bytes[:, 1:, :], 
+                        torch.zeros((input_bytes.shape[0], 1, 1), device=device)
+                    ], dim=1)
                 
-                text_logits = inverse_text_tokenizer(text_outputs)
-                text_loss = text_criterion(text_logits.view(-1, text_logits.size(-1)), 
-                                          text_target_tokens.view(-1))
+                # Feed through model
+                text_outputs = model(input_text, mode="text_to_text", generate=False,
+                                    target_outputs=caption_embeddings)
+                
+                # Apply inverse text tokenizer to get reconstructed byte sequences
+                reconstructed_bytes = inverse_text_tokenizer(text_outputs, return_bytes=True)
+                
+                # Make sure shapes match for comparison
+                min_len = min(reconstructed_bytes.shape[1], target_bytes.shape[1])
+                reconstructed_bytes = reconstructed_bytes[:, :min_len, :]
+                target_bytes = target_bytes[:, :min_len, :]
+                
+                # Calculate text reconstruction loss
+                text_loss = reconstruction_criterion(reconstructed_bytes, target_bytes)
                 
                 # Image generation with teacher forcing
-                target_image_embeddings, target_image_tokens = model.image_tokenizer(images)
+                target_image_embeddings, _ = model.image_tokenizer(images)
                 target_image_embeddings = target_image_embeddings.to(device)
                 
                 image_outputs = model(captions, mode="text_to_image", generate=False, 
@@ -222,8 +251,8 @@ def main():
                 predicted_image = model.inverse_image_tokenizer(image_outputs, 
                                                                original_size=model.image_size)
                 
-                # Ensure both tensors are on the same device
-                image_loss = image_criterion(predicted_image, images.to(predicted_image.device))
+                # Calculate image loss
+                image_loss = reconstruction_criterion(predicted_image, images.to(predicted_image.device))
                 
                 # Combined loss
                 loss = text_loss + image_loss
@@ -239,11 +268,7 @@ def main():
             if total_steps % 1000 == 0:
                 model.eval()
                 with torch.no_grad():
-                    # Generate text from a random image in the batch
-                    # Make sure images are on the model's device
-                    sample_image = images[0:1].to(device)
-                    generated_text = model(sample_image, mode="image_to_text", generate=True, max_new_tokens=50)
-                    print(f"Generated text: {generated_text}")
+                    # Remove image-to-text generation section
                     
                     # Generate image from a random caption
                     # No device issues here as captions is a list of strings

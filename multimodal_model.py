@@ -353,57 +353,6 @@ class MultimodalTransformer(nn.Module):
         else:
             # During training with teacher forcing, return the output embeddings
             return output_tokens
-    
-    def image_to_text(self, image_batch, generate=False, max_new_tokens=None, target_outputs=None):
-        """
-        image_batch: Batch of images [batch_size, channels, height, width]
-        generate: Whether to generate text autoregressively
-        max_new_tokens: Maximum number of text tokens to generate
-        target_outputs: Target text embeddings for teacher forcing
-        """
-        # Ensure image_batch is on the device of the model
-        device = next(self.parameters()).device
-        image_batch = image_batch.to(device)
-        
-        # Tokenize the image
-        image_embeddings, _ = self.image_tokenizer(image_batch)
-        # Make sure embeddings are on the right device
-        image_embeddings = image_embeddings.to(device)
-        
-        # Create special token for output type (all 0s for text)
-        batch_size = image_embeddings.size(0)
-        output_type_token = torch.zeros((batch_size, 1, self.d_model), device=device)
-        
-        # Append the output type token to the image embeddings
-        input_embeddings = torch.cat([image_embeddings, output_type_token], dim=1)
-        
-        # If target_outputs provided, ensure they're on the right device
-        if target_outputs is not None:
-            target_outputs = target_outputs.to(device)
-        
-        # Use the sequence processing logic from generate_from_text
-        if generate:
-            output_tokens = self.generate_from_text(
-                input_embeddings,  # Use embeddings directly
-                output_type="text",
-                generate=True,
-                max_new_tokens=max_new_tokens,
-                target_outputs=None  # Not used in generate mode
-            )
-            
-            # Convert to text
-            text_logits = self.inverse_text_tokenizer(output_tokens)
-            text_ids = torch.argmax(text_logits, dim=-1)
-            generated_text = self.inverse_text_tokenizer.decode(text_ids)
-            return generated_text
-        else:
-            return self.generate_from_text(
-                input_embeddings,  # Use embeddings directly
-                output_type="text",
-                generate=False,
-                max_new_tokens=None,
-                target_outputs=target_outputs
-            )
 
 def create_multimodal_model(
     model_size='base',  # 'small', 'base', 'large', 'xl'

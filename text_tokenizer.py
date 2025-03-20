@@ -191,10 +191,13 @@ class InverseTextTokenizer(nn.Module):
         self.expansion_factor = 8  # Total expansion: 2*2*2 = 8
         self.debug = debug
     
-    def forward(self, x, tokenizer=None):
+    def forward(self, x, tokenizer=None, return_bytes=False):
         """
         x: [batch_size, sequence_length, in_channels]
-        returns: logits of shape [batch_size, sequence_length, vocab_size]
+        tokenizer: Optional tokenizer for converting to text
+        return_bytes: If True, return raw byte tensor for reconstruction loss
+        returns: logits of shape [batch_size, sequence_length, vocab_size] or
+                 byte tensor of shape [batch_size, sequence_length, 1]
         """
         # Permute to [batch, channels, length] for Conv1d
         x_permuted = x.permute(0, 2, 1)
@@ -216,6 +219,14 @@ class InverseTextTokenizer(nn.Module):
         
         if self.debug:
             print(f"Output logits shape: {logits.shape}")
+        
+        # If return_bytes is True, convert logits to byte values
+        if return_bytes:
+            # Get the most likely byte for each position
+            byte_values = torch.argmax(logits, dim=-1).float()
+            # Reshape to [batch, seq_len, 1] to match input format
+            byte_tensor = byte_values.unsqueeze(-1)
+            return byte_tensor
         
         # If tokenizer provided, convert to text
         if tokenizer is not None:
