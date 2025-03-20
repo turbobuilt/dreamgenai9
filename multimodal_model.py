@@ -148,9 +148,6 @@ class MultimodalTransformer(nn.Module):
             debug=False
         )
         
-        # Special tokens to indicate modality and separation
-        self.modality_embeddings = nn.Embedding(2, d_model)  # 0: text, 1: image
-        
         # Input processing
         self.input_proj = nn.Linear(d_model, d_model)
         self.pos_encoder = PositionalEncoding(d_model, max_len)
@@ -169,62 +166,118 @@ class MultimodalTransformer(nn.Module):
         mask = torch.triu(torch.ones(max_len, max_len), diagonal=1).bool()
         self.register_buffer("causal_mask", mask)
         
-    def forward(self, x, mode="text_to_image", generate=False, max_new_tokens=None):
+    def forward(self, x, mode="text_to_text", generate=False, max_new_tokens=None, target_outputs=None):
         """
-        x: Input data of appropriate modality
-        mode: "text_to_image" or "image_to_text"
+        x: Input data (text)
+        mode: "text_to_text" or "text_to_image"
         generate: Whether to generate output autoregressively
         max_new_tokens: Maximum number of tokens to generate
+        target_outputs: Target outputs for teacher forcing during training
         """
-        if mode == "text_to_image":
-            return self.text_to_image(x, generate, max_new_tokens)
-        elif mode == "image_to_text":
-            return self.image_to_text(x, generate, max_new_tokens)
+        if mode == "text_to_text":
+            return self.text_to_text(x, generate, max_new_tokens, target_outputs=target_outputs)
+        elif mode == "text_to_image":
+            return self.text_to_image(x, generate, max_new_tokens, target_outputs=target_outputs)
         else:
             raise ValueError(f"Unsupported mode: {mode}")
     
-    def text_to_image(self, text_batch, generate=False, max_new_tokens=None):
+    def generate_from_text(self, text_batch, output_type, generate=False, max_new_tokens=None, target_outputs=None):
         """
+        Shared generation method for both text_to_text and text_to_image
+        
         text_batch: List of strings or batch of text tokens
-        generate: Whether to generate image autoregressively
-        max_new_tokens: Maximum number of image patches to generate
+        output_type: "text" or "image" to determine the special token
+        generate: Whether to generate autoregressively
+        max_new_tokens: Maximum number of tokens to generate
+        target_outputs: Target outputs for teacher forcing
         """
         batch_size = len(text_batch) if isinstance(text_batch, list) else text_batch.size(0)
         
-        # Tokenize text
+        
+
+        # Tokenize text - now handling tuple return value
         text_embeddings, text_tokens = self.text_tokenizer(text_batch)
+        # Move to the appropriate device
+        device = next(self.parameters()).device
+        text_embeddings = text_embeddings.to(device)
+        text_tokens = text_tokens.to(device)
         text_len = text_embeddings.size(1)
         
-        # Add modality embeddings to text
-        text_modality = torch.zeros(batch_size, text_len, dtype=torch.long, device=text_embeddings.device)
-        text_embeddings = text_embeddings + self.modality_embeddings(text_modality)
+        # Create special token for output type (all 0s for text, all 1s for image)
+        # Ensure it's on the same device as text_embeddings
+        output_type_token = torch.zeros((batch_size, 1, self.d_model), device=device)
+        if output_type == "image":
+            output_type_token = torch.ones((batch_size, 1, self.d_model), device=device)
+        
+        # Append the output type token to the text embeddings
+        input_embeddings = torch.cat([text_embeddings, output_type_token], dim=1)
+        input_len = input_embeddings.size(1)
         
         if not generate:
-            # For training with teacher forcing
-            # We need target images here
-            raise NotImplementedError("Training requires target images to be provided")
+            # Teacher forcing mode (for training)
+            if target_outputs is None:
+                raise ValueError("Teacher forcing requires target_outputs to be provided")
+            
+            # Ensure target_outputs is on the same device
+            target_outputs = target_outputs.to(device)
+            
+            # Prepare full sequence for teacher forcing
+            full_sequence = torch.cat([input_embeddings, target_outputs], dim=1)
+            
+            # Process the sequence
+            x = self.input_proj(full_sequence)
+            x = self.pos_encoder(x)
+            
+            # Create causal mask for the entire sequence
+            seq_len = x.size(1)
+            mask = torch.ones(seq_len, seq_len, device=device) * float('-inf')
+            
+            # Allow full visibility of input tokens
+            mask[:, :input_len] = 0
+            
+            # For output tokens, apply causal masking
+            for j in range(input_len, seq_len):
+                mask[j, :j+1] = 0
+            
+            # Apply transformer blocks
+            for block in self.transformer_blocks:
+                x = block(x, mask=mask)
+            
+            # Apply output projection
+            outputs = self.output_proj(x)
+            
+            # We're only interested in the predictions for target positions
+            output_embeddings = outputs[:, input_len:, :]
+            
+            return output_embeddings
         
         else:
             # Autoregressive generation mode
-            generated = text_embeddings
-            image_tokens = torch.zeros((batch_size, 0, self.d_model), device=text_embeddings.device)
+            generated = input_embeddings
+            output_tokens = torch.zeros((batch_size, 0, self.d_model), device=device)
             
-            # Generate image patches one by one
-            for i in range(max_new_tokens if max_new_tokens else self.num_patches):
-                # Combine text and currently generated image tokens
-                combined = torch.cat([generated, image_tokens], dim=1)
+            # Set max tokens based on output type
+            if output_type == "text":
+                max_tokens = max_new_tokens if max_new_tokens else self.text_tokenizer.max_sequence_length
+            else:  # image
+                max_tokens = max_new_tokens if max_new_tokens else self.num_patches
+            
+            # Generate tokens one by one
+            for i in range(max_tokens):
+                # Combine input and currently generated output tokens
+                combined = torch.cat([generated, output_tokens], dim=1)
                 combined = self.input_proj(combined)
                 combined = self.pos_encoder(combined)
                 
                 # Create appropriate mask
                 curr_len = combined.size(1)
-                mask = torch.ones(curr_len, curr_len, device=combined.device) * float('-inf')
+                mask = torch.ones(curr_len, curr_len, device=device) * float('-inf')
                 
-                # Allow seeing all text tokens
-                mask[:, :text_len] = 0
+                # Allow seeing all input tokens
+                mask[:, :input_len] = 0
                 
-                # Apply causal masking for image tokens
-                for j in range(text_len, curr_len):
+                # Apply causal masking for output tokens
+                for j in range(input_len, curr_len):
                     mask[j, :j+1] = 0
                 
                 # Apply transformer blocks
@@ -234,101 +287,123 @@ class MultimodalTransformer(nn.Module):
                 # Get next token prediction (only for the latest position)
                 next_token = self.output_proj(combined[:, -1:, :])
                 
-                # Append to generated image tokens
-                image_tokens = torch.cat([image_tokens, next_token], dim=1)
+                # Append to generated output tokens
+                output_tokens = torch.cat([output_tokens, next_token], dim=1)
+                
+                # For text generation, check if we've generated an end token (can be customized)
+                if output_type == "text" and i > 0:
+                    # Check for special end of text condition
+                    # This is placeholder logic - you'd need to implement proper end token detection
+                    next_token_logits = self.inverse_text_tokenizer(next_token)
+                    next_token_id = torch.argmax(next_token_logits, dim=-1)
+                    if (next_token_id == 0).all():  # Assuming 0 is end token
+                        break
             
-            # Add modality embeddings to image tokens
-            image_modality = torch.ones(batch_size, image_tokens.size(1), dtype=torch.long, device=image_tokens.device)
-            image_tokens = image_tokens + self.modality_embeddings(image_modality)
+            return output_tokens
+    
+    def text_to_text(self, text_batch, generate=False, max_new_tokens=None, target_outputs=None):
+        """
+        text_batch: List of strings or batch of text tokens
+        generate: Whether to generate text autoregressively
+        max_new_tokens: Maximum number of text tokens to generate
+        target_outputs: Target text embeddings for teacher forcing
+        """
+        output_tokens = self.generate_from_text(
+            text_batch, 
+            output_type="text",
+            generate=generate, 
+            max_new_tokens=max_new_tokens,
+            target_outputs=target_outputs
+        )
+        
+        if generate:
+            # Convert token embeddings to text tokens then to text
+            text_logits = self.inverse_text_tokenizer(output_tokens)
+            text_ids = torch.argmax(text_logits, dim=-1)
             
+            # Convert to text
+            generated_text = self.inverse_text_tokenizer.decode(text_ids)
+            return generated_text
+        else:
+            # During training with teacher forcing, return the output embeddings
+            return output_tokens
+    
+    def text_to_image(self, text_batch, generate=False, max_new_tokens=None, target_outputs=None):
+        """
+        text_batch: List of strings or batch of text tokens
+        generate: Whether to generate image autoregressively
+        max_new_tokens: Maximum number of image patches to generate
+        target_outputs: Target image tokens for teacher forcing
+        """
+        output_tokens = self.generate_from_text(
+            text_batch, 
+            output_type="image",
+            generate=generate, 
+            max_new_tokens=max_new_tokens,
+            target_outputs=target_outputs
+        )
+        
+        if generate:
             # Detokenize the generated image tokens
             generated_image = self.inverse_image_tokenizer(
-                image_tokens,
+                output_tokens,
                 original_size=self.image_size
             )
-            
             return generated_image
+        else:
+            # During training with teacher forcing, return the output embeddings
+            return output_tokens
     
-    def image_to_text(self, image_batch, generate=False, max_new_tokens=None):
+    def image_to_text(self, image_batch, generate=False, max_new_tokens=None, target_outputs=None):
         """
         image_batch: Batch of images [batch_size, channels, height, width]
         generate: Whether to generate text autoregressively
         max_new_tokens: Maximum number of text tokens to generate
+        target_outputs: Target text embeddings for teacher forcing
         """
-        batch_size = image_batch.size(0)
+        # Ensure image_batch is on the device of the model
+        device = next(self.parameters()).device
+        image_batch = image_batch.to(device)
         
-        # Tokenize image
-        image_embeddings = self.image_tokenizer(image_batch)
-        image_len = image_embeddings.size(1)
+        # Tokenize the image
+        image_embeddings, _ = self.image_tokenizer(image_batch)
+        # Make sure embeddings are on the right device
+        image_embeddings = image_embeddings.to(device)
         
-        # Add modality embeddings to image
-        image_modality = torch.ones(batch_size, image_len, dtype=torch.long, device=image_embeddings.device)
-        image_embeddings = image_embeddings + self.modality_embeddings(image_modality)
+        # Create special token for output type (all 0s for text)
+        batch_size = image_embeddings.size(0)
+        output_type_token = torch.zeros((batch_size, 1, self.d_model), device=device)
         
-        if not generate:
-            # For training with teacher forcing
-            # We need target text here
-            raise NotImplementedError("Training requires target text to be provided")
+        # Append the output type token to the image embeddings
+        input_embeddings = torch.cat([image_embeddings, output_type_token], dim=1)
         
-        else:
-            # Autoregressive generation mode
-            generated = image_embeddings
-            text_tokens = torch.zeros((batch_size, 0, self.d_model), device=image_embeddings.device)
-            
-            # Generate text tokens one by one
-            max_tokens = max_new_tokens if max_new_tokens else self.text_tokenizer.max_sequence_length
-            for i in range(max_tokens):
-                # Combine image and currently generated text tokens
-                combined = torch.cat([generated, text_tokens], dim=1)
-                combined = self.input_proj(combined)
-                combined = self.pos_encoder(combined)
-                
-                # Create appropriate mask
-                curr_len = combined.size(1)
-                mask = torch.ones(curr_len, curr_len, device=combined.device) * float('-inf')
-                
-                # Allow seeing all image tokens
-                mask[:, :image_len] = 0
-                
-                # Apply causal masking for text tokens
-                for j in range(image_len, curr_len):
-                    mask[j, :j+1] = 0
-                
-                # Apply transformer blocks
-                for block in self.transformer_blocks:
-                    combined = block(combined, mask=mask)
-                
-                # Get next token prediction (only for the latest position)
-                next_token_embed = self.output_proj(combined[:, -1:, :])
-                
-                # Project to vocabulary space
-                next_token_logits = self.inverse_text_tokenizer(next_token_embed)
-                
-                # Get token with highest probability
-                next_token_id = torch.argmax(next_token_logits, dim=-1)
-                
-                # Convert token ID to embedding
-                next_token_embed, _ = self.text_tokenizer([next_token_id])
-                
-                # Append to generated text tokens
-                text_tokens = torch.cat([text_tokens, next_token_embed], dim=1)
-                
-                # Check if we've generated an end token
-                if (next_token_id == 0).all():
-                    break
-            
-            # Add modality embeddings to text tokens
-            text_modality = torch.zeros(batch_size, text_tokens.size(1), dtype=torch.long, device=text_tokens.device)
-            text_tokens = text_tokens + self.modality_embeddings(text_modality)
-            
-            # Get token predictions
-            text_logits = self.inverse_text_tokenizer(text_tokens)
-            text_ids = torch.argmax(text_logits, dim=-1)
+        # If target_outputs provided, ensure they're on the right device
+        if target_outputs is not None:
+            target_outputs = target_outputs.to(device)
+        
+        # Use the sequence processing logic from generate_from_text
+        if generate:
+            output_tokens = self.generate_from_text(
+                input_embeddings,  # Use embeddings directly
+                output_type="text",
+                generate=True,
+                max_new_tokens=max_new_tokens,
+                target_outputs=None  # Not used in generate mode
+            )
             
             # Convert to text
-            generated_text = self.text_tokenizer.binary_tokens_to_text(text_ids)
-            
+            text_logits = self.inverse_text_tokenizer(output_tokens)
+            text_ids = torch.argmax(text_logits, dim=-1)
+            generated_text = self.inverse_text_tokenizer.decode(text_ids)
             return generated_text
+        else:
+            return self.generate_from_text(
+                input_embeddings,  # Use embeddings directly
+                output_type="text",
+                generate=False,
+                max_new_tokens=None,
+                target_outputs=target_outputs
+            )
 
 def create_multimodal_model(
     model_size='base',  # 'small', 'base', 'large', 'xl'

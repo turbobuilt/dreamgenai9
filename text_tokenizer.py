@@ -7,19 +7,19 @@ class TextTokenizer(nn.Module):
     def __init__(
         self,
         out_channels=512,
-        kernel_size=2,  # Process 2 bytes at a time
+        bytes_per_token=2,  # Changed from kernel_size to bytes_per_token
         max_sequence_length=1024,
         debug=False
     ):
         super().__init__()
         
         self.encoder = nn.Sequential(
-            # First layer: process 2 bytes at a time
+            # First layer: process bytes_per_token bytes at a time
             nn.Conv1d(
                 in_channels=1,
                 out_channels=out_channels//2,
-                kernel_size=kernel_size,
-                stride=kernel_size
+                kernel_size=bytes_per_token,
+                stride=bytes_per_token
             ),
             nn.GELU(),
             nn.BatchNorm1d(out_channels//2),
@@ -45,7 +45,7 @@ class TextTokenizer(nn.Module):
             nn.BatchNorm1d(out_channels)
         )
         
-        self.kernel_size = kernel_size
+        self.bytes_per_token = bytes_per_token  # Store for future use
         self.out_channels = out_channels
         self.max_sequence_length = max_sequence_length
         self.debug = debug
@@ -98,7 +98,9 @@ class TextTokenizer(nn.Module):
         """
         Convert text to tokenized representation
         text_batch: list of strings or tensor of shape [batch_size, sequence_length, 1]
-        returns: tensor of shape [batch_size, reduced_length, out_channels]
+        returns: tuple of (embeddings, tokens) where:
+            - embeddings: tensor of shape [batch_size, reduced_length, out_channels]
+            - tokens: tensor of shape [batch_size, sequence_length]
         """
         if isinstance(text_batch, list) and isinstance(text_batch[0], str):
             # Convert text to bytes tensor
@@ -110,11 +112,18 @@ class TextTokenizer(nn.Module):
         if self.debug:
             print(f"Input tensor shape: {x.shape}")
         
+        # Store the original tokens for return
+        tokens = x.squeeze(-1).long()
+        
         # Permute to [batch, channels, length] for Conv1d
         x_permuted = x.permute(0, 2, 1)
         
         if self.debug:
             print(f"Permuted tensor shape: {x_permuted.shape}")
+        
+        # Get the device of the model parameters and move input tensor to that device
+        device = next(self.parameters()).device
+        x_permuted = x_permuted.to(device)
         
         # Apply encoding
         encoded = self.encoder(x_permuted)
@@ -128,7 +137,7 @@ class TextTokenizer(nn.Module):
         if self.debug:
             print(f"Encoded tensor shape: {encoded.shape}")
         
-        return encoded
+        return encoded, tokens
 
 
 class InverseTextTokenizer(nn.Module):
@@ -136,10 +145,17 @@ class InverseTextTokenizer(nn.Module):
         self,
         in_channels=512,
         out_channels=1,
-        kernel_size=2,
+        bytes_per_token=2,  # Changed from kernel_size to bytes_per_token
+        vocab_size=None,    # Added vocab_size parameter
         debug=False
     ):
         super().__init__()
+        
+        # If vocab_size is not provided, calculate it from bytes_per_token
+        if vocab_size is None:
+            vocab_size = 2**(8*bytes_per_token)
+            
+        self.vocab_size = vocab_size
         
         self.decoder = nn.Sequential(
             # First layer: expand channels
@@ -162,23 +178,23 @@ class InverseTextTokenizer(nn.Module):
             nn.GELU(),
             nn.BatchNorm1d(in_channels//4 * 2),
             
-            # Third layer: upsample by 2 again
+            # Third layer: upsample by 2 again and project to vocab size
             nn.Conv1d(
                 in_channels=in_channels//4 * 2,
-                out_channels=out_channels * kernel_size * 4,  # Final upsampling factor of 8
+                out_channels=vocab_size,  # Output dimension is vocab_size for classification
                 kernel_size=1,
                 stride=1
             )
         )
         
-        self.kernel_size = kernel_size
+        self.bytes_per_token = bytes_per_token  # Store for consistency
         self.expansion_factor = 8  # Total expansion: 2*2*2 = 8
         self.debug = debug
     
     def forward(self, x, tokenizer=None):
         """
         x: [batch_size, sequence_length, in_channels]
-        returns: reconstructed bytes tensor of shape [batch_size, expanded_length, 1]
+        returns: logits of shape [batch_size, sequence_length, vocab_size]
         """
         # Permute to [batch, channels, length] for Conv1d
         x_permuted = x.permute(0, 2, 1)
@@ -192,24 +208,33 @@ class InverseTextTokenizer(nn.Module):
         if self.debug:
             print(f"Decoded tensor shape: {decoded.shape}")
         
-        # Reshape to get back original byte dimensions
-        batch_size, channels, time_steps = decoded.shape
-        
-        # Reshape: [batch, channels, time] -> [batch, time*expansion_factor, 1]
-        reshaped = decoded.permute(0, 2, 1).reshape(batch_size, time_steps * self.expansion_factor, 1)
+        # Permute back to [batch, length, vocab_size]
+        logits = decoded.permute(0, 2, 1)
         
         # Ensure output tensor is contiguous
-        reshaped = reshaped.contiguous()
+        logits = logits.contiguous()
         
         if self.debug:
-            print(f"Reshaped tensor shape: {reshaped.shape}")
+            print(f"Output logits shape: {logits.shape}")
         
         # If tokenizer provided, convert to text
         if tokenizer is not None:
-            text = tokenizer.bytes_tensor_to_text(reshaped)
+            text_ids = torch.argmax(logits, dim=-1)
+            text = tokenizer.bytes_tensor_to_text(text_ids.unsqueeze(-1))
             return text
         
-        return reshaped
+        return logits
+    
+    def decode(self, token_ids):
+        """
+        Convert token IDs back to text
+        token_ids: tensor of shape [batch_size, sequence_length]
+        returns: list of strings
+        """
+        # This is a placeholder - implement actual decoding logic
+        # For now, just return a dummy string
+        batch_size = token_ids.shape[0]
+        return ["decoded text"] * batch_size
 
 
 if __name__ == "__main__":
@@ -220,18 +245,18 @@ if __name__ == "__main__":
     ]
     
     # Initialize tokenizer and inverse tokenizer with debug=True
-    tokenizer = TextTokenizer(out_channels=512, kernel_size=2, debug=True)
-    inverse_tokenizer = InverseTextTokenizer(in_channels=512, out_channels=1, kernel_size=2, debug=True)
+    tokenizer = TextTokenizer(out_channels=512, bytes_per_token=2, debug=True)
+    inverse_tokenizer = InverseTextTokenizer(in_channels=512, out_channels=1, bytes_per_token=2, debug=True)
     
     # Tokenize and reconstruct
-    encoded = tokenizer(sample_texts)
+    encoded, tokens = tokenizer(sample_texts)
     print(f"Encoded shape: {encoded.shape}")
     
-    reconstructed = inverse_tokenizer(encoded)
-    print(f"Reconstructed shape: {reconstructed.shape}")
+    reconstructed_logits = inverse_tokenizer(encoded)
+    print(f"Reconstructed logits shape: {reconstructed_logits.shape}")
     
-    # Convert reconstructed tensor back to text
-    reconstructed_texts = tokenizer.bytes_tensor_to_text(reconstructed)
+    # Convert reconstructed logits back to text
+    reconstructed_texts = inverse_tokenizer(reconstructed_logits, tokenizer=tokenizer)
     
     # Print results
     for i, (original, reconstructed) in enumerate(zip(sample_texts, reconstructed_texts)):
@@ -241,5 +266,5 @@ if __name__ == "__main__":
         
     # Calculate reconstruction error
     original_tensor = tokenizer.text_to_bytes_tensor(sample_texts)
-    error = torch.mean((original_tensor[:, :reconstructed.shape[1], :] - reconstructed) ** 2).item()
+    error = torch.mean((original_tensor[:, :reconstructed_logits.shape[1], :] - reconstructed_logits) ** 2).item()
     print(f"\nMean squared reconstruction error: {error:.6f}")

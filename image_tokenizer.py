@@ -37,7 +37,8 @@ class ImageTokenizer(nn.Module):
     def forward(self, x):
         """
         x: [batch_size, channels, height, width]
-        returns: [batch_size, num_patches, out_channels]
+        returns: tuple of ([batch_size, num_patches, out_channels], image_tokens)
+        where image_tokens is a flattened representation of the input
         """
         batch_size, channels, height, width = x.shape
         
@@ -52,6 +53,10 @@ class ImageTokenizer(nn.Module):
             if self.debug:
                 print(f"Padded shape: {x.shape}")
         
+        # Store input tokens for return (flattened image representation)
+        # This is used for consistency with TextTokenizer
+        image_tokens = x.reshape(batch_size, -1)
+        
         # Apply convolutional encoding
         encoded = self.encoder(x)
         
@@ -65,7 +70,7 @@ class ImageTokenizer(nn.Module):
         if self.debug:
             print(f"Output embeddings: {embeddings.shape}")
         
-        return embeddings
+        return embeddings, image_tokens
 
 class InverseImageTokenizer(nn.Module):
     def __init__(

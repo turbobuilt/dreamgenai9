@@ -157,42 +157,73 @@ def main():
             # Training step
             optimizer.zero_grad()
             
-            # Phase 1: Text Generation - Get first token and predict the rest
-            # We'll use teacher forcing during training
+            # Phase 1: Text Generation - Using teacher forcing
             text_loss = 0
             if args.device == 'cuda':
                 with autocast('cuda'):  # Updated to new format
-                    # For text generation training, we use all but the last token as input
-                    # and predict the next token in sequence
-                    text_input = caption_embeddings[:, :-1, :]
-                    text_target = caption_tokens[:, 1:]  # Shift by 1 to get next token
+                    # Tokenize input text
+                    input_text = captions
+                    # Target is the same text shifted by one position
+                    text_target_embeddings, text_target_tokens = text_tokenizer(captions)
+                    text_target_embeddings = text_target_embeddings[:, 1:, :].to(device)  # Shift by one
+                    text_target_tokens = text_target_tokens[:, 1:].to(device)  # Shift by one
                     
-                    # Get token predictions from model - using the inverse_text_tokenizer directly
-                    text_logits = inverse_text_tokenizer(text_input)
+                    # Feed to model with teacher forcing
+                    text_outputs = model(input_text, mode="text_to_text", generate=False, 
+                                         target_outputs=text_target_embeddings)
+                    
+                    # Apply inverse text tokenizer to get logits
+                    text_logits = inverse_text_tokenizer(text_outputs)
                     
                     # Calculate text loss
-                    text_loss = text_criterion(text_logits.view(-1, text_logits.size(-1)), text_target.view(-1))
+                    text_loss = text_criterion(text_logits.view(-1, text_logits.size(-1)), 
+                                              text_target_tokens.view(-1))
                     
-                    # Phase 2: Image Generation - Using generation mode for training to avoid NotImplementedError
-                    # We'll use the generated image and compare it with the target
-                    predicted_image = model(captions, mode="text_to_image", generate=True)
+                    # Phase 2: Image Generation - Using teacher forcing
+                    # Tokenize the target image
+                    target_image_embeddings, target_image_tokens = model.image_tokenizer(images)
+                    target_image_embeddings = target_image_embeddings.to(device)
                     
-                    # Calculate image loss
-                    image_loss = image_criterion(predicted_image, images)
+                    # Feed to model with teacher forcing
+                    image_outputs = model(captions, mode="text_to_image", generate=False, 
+                                          target_outputs=target_image_embeddings)
+                    
+                    # Generate image from embeddings
+                    predicted_image = model.inverse_image_tokenizer(image_outputs, 
+                                                                   original_size=model.image_size)
+                    
+                    # Calculate image loss - ensure both tensors are on the same device
+                    image_loss = image_criterion(predicted_image, images.to(predicted_image.device))
                     
                     # Combined loss
                     loss = text_loss + image_loss
             else:
                 # Non-CUDA implementation without autocast
-                # Text generation training
-                text_input = caption_embeddings[:, :-1, :]
-                text_target = caption_tokens[:, 1:]
-                text_logits = inverse_text_tokenizer(text_input)
-                text_loss = text_criterion(text_logits.view(-1, text_logits.size(-1)), text_target.view(-1))
+                # Text generation with teacher forcing
+                input_text = captions
+                text_target_embeddings, text_target_tokens = text_tokenizer(captions)
+                text_target_embeddings = text_target_embeddings[:, 1:, :].to(device)
+                text_target_tokens = text_target_tokens[:, 1:].to(device)
                 
-                # Image generation training - same approach as with CUDA
-                predicted_image = model(captions, mode="text_to_image", generate=True)
-                image_loss = image_criterion(predicted_image, images)
+                text_outputs = model(input_text, mode="text_to_text", generate=False, 
+                                     target_outputs=text_target_embeddings)
+                
+                text_logits = inverse_text_tokenizer(text_outputs)
+                text_loss = text_criterion(text_logits.view(-1, text_logits.size(-1)), 
+                                          text_target_tokens.view(-1))
+                
+                # Image generation with teacher forcing
+                target_image_embeddings, target_image_tokens = model.image_tokenizer(images)
+                target_image_embeddings = target_image_embeddings.to(device)
+                
+                image_outputs = model(captions, mode="text_to_image", generate=False, 
+                                      target_outputs=target_image_embeddings)
+                
+                predicted_image = model.inverse_image_tokenizer(image_outputs, 
+                                                               original_size=model.image_size)
+                
+                # Ensure both tensors are on the same device
+                image_loss = image_criterion(predicted_image, images.to(predicted_image.device))
                 
                 # Combined loss
                 loss = text_loss + image_loss
@@ -209,10 +240,13 @@ def main():
                 model.eval()
                 with torch.no_grad():
                     # Generate text from a random image in the batch
-                    generated_text = model(images[0:1], mode="image_to_text", generate=True, max_new_tokens=50)
+                    # Make sure images are on the model's device
+                    sample_image = images[0:1].to(device)
+                    generated_text = model(sample_image, mode="image_to_text", generate=True, max_new_tokens=50)
                     print(f"Generated text: {generated_text}")
                     
                     # Generate image from a random caption
+                    # No device issues here as captions is a list of strings
                     generated_image = model(captions[0:1], mode="text_to_image", generate=True)
                     
                     # Save generated image
